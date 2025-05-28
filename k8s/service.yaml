@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: cloud-service
+  namespace: cloud-service
+spec:
+  type: LoadBalancer
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8080
+    protocol: TCP
+  - name: metrics
+    port: 9090
+    targetPort: 9090
+    protocol: TCP
+  - name: tracing
+    port: 14268
+    targetPort: 14268
+    protocol: TCP
+  selector:
+    app: cloud-service 

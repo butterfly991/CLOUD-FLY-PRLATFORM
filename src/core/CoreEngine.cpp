@@ -1,0 +1,958 @@
+#include "CoreEngine.h"
+#include "blockchain/fpga_miner.h"
+#include "blockchain/gpu_miner.h"
+#include "boost/asio/executor_work_guard.hpp"
+#include "config/config_loader.h"
+#include "network/asio_stack.h"
+#include <csignal>
+#include <memory>
+#include <stdexcept>
+#include <sys/sysinfo.h>
+#include <thread>
+#include <iostream>
+#include <algorithm>
+#include <sstream>
+#include <iomanip>
+#include <chrono>
+#include <random>
+#include <cstring>
+
+#ifdef __x86_64__
+#include <immintrin.h>
+#elif defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
+namespace core {
+
+// Реализация ThreadManager
+ThreadManager::ThreadManager(size_t poolSize) 
+    : poolSize_(poolSize) {
+    threads_.reserve(poolSize);
+}
+
+ThreadManager::~ThreadManager() {
+    stop();
+}
+
+void ThreadManager::start() {
+    stop_ = false;
+    pause_ = false;
+    
+    for (size_t i = 0; i < poolSize_; ++i) {
+        threads_.emplace_back(&ThreadManager::workerThread, this);
+    }
+}
+
+void ThreadManager::stop() {
+    {
+        std::lock_guard<std::mutex> lock(queueMutex_);
+        stop_ = true;
+    }
+    condition_.notify_all();
+    
+    for (auto& thread : threads_) {
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+    
+    threads_.clear();
+    while (!tasks_.empty()) {
+        tasks_.pop();
+    }
+}
+
+void ThreadManager::pause() {
+    pause_ = true;
+}
+
+void ThreadManager::resume() {
+    pause_ = false;
+    condition_.notify_all();
+}
+
+void ThreadManager::workerThread() {
+    while (true) {
+        std::function<void()> task;
+        {
+            std::unique_lock<std::mutex> lock(queueMutex_);
+            condition_.wait(lock, [this] {
+                return stop_ || (!pause_ && !tasks_.empty());
+            });
+            
+            if (stop_ && tasks_.empty()) {
+                return;
+            }
+            
+            if (!tasks_.empty()) {
+                task = std::move(tasks_.front());
+                tasks_.pop();
+            }
+        }
+        
+        if (task) {
+            ++activeThreads_;
+            task();
+            --activeThreads_;
+        }
+    }
+}
+
+size_t ThreadManager::getActiveThreads() const {
+    return activeThreads_;
+}
+
+size_t ThreadManager::getQueueSize() const {
+    std::lock_guard<std::mutex> lock(queueMutex_);
+    return tasks_.size();
+}
+
+float ThreadManager::getThreadUtilization() const {
+    return static_cast<float>(activeThreads_) / poolSize_;
+}
+
+// Реализация CacheManager
+CacheManager::CacheManager() {
+    initialize();
+}
+
+CacheManager::~CacheManager() {
+    clear();
+}
+
+void CacheManager::initialize() {
+    // Определяем размер кэша на основе архитектуры
+    size_t cacheSize = 0;
+#ifdef __linux__
+    std::ifstream cacheinfo("/sys/devices/system/cpu/cpu0/cache/index3/size");
+    if (cacheinfo.is_open()) {
+        std::string size;
+        std::getline(cacheinfo, size);
+        cacheSize = std::stoull(size) * 1024; // Convert KB to bytes
+    }
+#elif defined(_WIN32)
+    int cpuInfo[4];
+    __cpuid(cpuInfo, 0x80000006);
+    cacheSize = ((cpuInfo[2] >> 16) & 0xFF) * 1024;
+#elif defined(__APPLE__)
+    size_t size = sizeof(cacheSize);
+    if (sysctlbyname("hw.l3cachesize", &cacheSize, &size, nullptr, 0) != 0) {
+        cacheSize = 0;
+    }
+#endif
+
+    if (cacheSize == 0) {
+        cacheSize = 8 * 1024 * 1024; // Default to 8MB if detection fails
+    }
+
+    size_t numLines = cacheSize / CACHE_LINE_SIZE;
+    cacheLines_.resize(numLines);
+}
+
+void CacheManager::clear() {
+    std::lock_guard<std::mutex> lock(cacheMutex_);
+    for (auto& line : cacheLines_) {
+        line.valid = false;
+    }
+    resetStats();
+}
+
+void CacheManager::prefetch(const void* ptr, size_t size) {
+#ifdef __x86_64__
+    const char* p = static_cast<const char*>(ptr);
+    for (size_t i = 0; i < size; i += CACHE_LINE_SIZE) {
+        _mm_prefetch(p + i, _MM_HINT_T0);
+    }
+#elif defined(__aarch64__)
+    const char* p = static_cast<const char*>(ptr);
+    for (size_t i = 0; i < size; i += CACHE_LINE_SIZE) {
+        __builtin_prefetch(p + i, 1, 3);
+    }
+#endif
+}
+
+void CacheManager::deallocate(void* ptr) {
+    if (!ptr) return;
+    
+    std::lock_guard<std::mutex> lock(cacheMutex_);
+    // TODO: Реализовать эффективное освобождение памяти
+}
+
+size_t CacheManager::getCacheSize() const {
+    return cacheLines_.size() * CACHE_LINE_SIZE;
+}
+
+float CacheManager::getHitRate() const {
+    uint64_t total = hits_ + misses_;
+    return total > 0 ? static_cast<float>(hits_) / total : 0.0f;
+}
+
+void CacheManager::resetStats() {
+    hits_ = 0;
+    misses_ = 0;
+}
+
+// Реализация CoreEngine
+CoreEngine& CoreEngine::getInstance() {
+    static CoreEngine instance;
+    return instance;
+}
+
+CoreEngine::CoreEngine() {
+    stats_.startTime = std::chrono::steady_clock::now();
+}
+
+CoreEngine::~CoreEngine() {
+    shutdown();
+}
+
+void CoreEngine::initialize() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (initialized_) return;
+
+    try {
+        initializeArchitecture();
+        initializeDrivers();
+        initializeManagers();
+        initialized_ = true;
+    } catch (const std::exception& e) {
+        std::cerr << "Failed to initialize CoreEngine: " << e.what() << std::endl;
+        cleanup();
+        throw;
+    }
+}
+
+void CoreEngine::shutdown() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!initialized_ || shutdown_) return;
+
+    shutdown_ = true;
+    cleanup();
+}
+
+void CoreEngine::reconfigure(const std::string& config) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!initialized_) return;
+
+    // TODO: Реализовать конфигурацию на основе JSON/YAML
+}
+
+void CoreEngine::setThreadPoolSize(size_t size) {
+    if (threadManager_) {
+        threadManager_->stop();
+        threadManager_ = std::make_unique<ThreadManager>(size);
+        threadManager_->start();
+    }
+}
+
+void CoreEngine::setCacheSize(size_t size) {
+    if (cacheManager_) {
+        cacheManager_->clear();
+        // TODO: Реализовать изменение размера кэша
+    }
+}
+
+void CoreEngine::setMemoryLimit(size_t limit) {
+    if (memoryManager_) {
+        // TODO: Реализовать установку лимита памяти
+    }
+}
+
+CoreStats CoreEngine::getStats() const {
+    return stats_;
+}
+
+void CoreEngine::resetStats() {
+    stats_ = CoreStats{};
+    stats_.startTime = std::chrono::steady_clock::now();
+}
+
+ThreadManager& CoreEngine::getThreadManager() {
+    return *threadManager_;
+}
+
+CacheManager& CoreEngine::getCacheManager() {
+    return *cacheManager_;
+}
+
+MemoryManager& CoreEngine::getMemoryManager() {
+    return *memoryManager_;
+}
+
+NetworkManager& CoreEngine::getNetworkManager() {
+    return *networkManager_;
+}
+
+BlockchainManager& CoreEngine::getBlockchainManager() {
+    return *blockchainManager_;
+}
+
+ComputeManager& CoreEngine::getComputeManager() {
+    return *computeManager_;
+}
+
+DriverManager& CoreEngine::getDriverManager() {
+    return *driverManager_;
+}
+
+void CoreEngine::initializeArchitecture() {
+    auto& arch = arch::ArchitectureOptimizer::getInstance();
+    arch.initialize();
+    
+    auto sysInfo = arch.getSystemInfo();
+    std::cout << "Initializing CoreEngine for " << sysInfo.osName 
+              << " on " << sysInfo.cpu.model << std::endl;
+}
+
+void CoreEngine::initializeDrivers() {
+    driverManager_ = std::make_unique<DriverManager>();
+    driverManager_->initialize();
+}
+
+void CoreEngine::initializeManagers() {
+    threadManager_ = std::make_unique<ThreadManager>();
+    cacheManager_ = std::make_unique<CacheManager>();
+    memoryManager_ = std::make_unique<MemoryManager>();
+    networkManager_ = std::make_unique<NetworkManager>();
+    blockchainManager_ = std::make_unique<BlockchainManager>();
+    computeManager_ = std::make_unique<ComputeManager>();
+
+    threadManager_->start();
+}
+
+void CoreEngine::cleanup() {
+    if (threadManager_) {
+        threadManager_->stop();
+    }
+    
+    // Очищаем все менеджеры в обратном порядке инициализации
+    computeManager_.reset();
+    blockchainManager_.reset();
+    networkManager_.reset();
+    memoryManager_.reset();
+    cacheManager_.reset();
+    threadManager_.reset();
+    driverManager_.reset();
+}
+
+CoreEngine::CoreEngine(
+    std::string config_path,
+    std::shared_ptr<SecretVault> secret_vault,
+    std::shared_ptr<MetricsReporter> metrics_reporter,
+    std::shared_ptr<ConfigValidator> config_validator,
+    std::shared_ptr<Logger> logger,
+    std::shared_ptr<NetworkConfig> network_config,
+    std::shared_ptr<PluginManager> plugin_manager
+): 
+    m_work_guard(asio::make_work_guard(m_io_ctx)),
+    m_work_pool(std::thread::hardware_concurrency()),
+    m_config_path(std::move(config_path)),
+    m_secret_vault(std::move(secret_vault)),
+    m_config_validator(std::move(config_validator)),
+    m_logger(logger),
+    m_network_config(network_config ? std::move(network_config) 
+    : std::make_shared<NetworkConfig>()),
+    m_plugin_manager(plugin_manager ? std::move(plugin_manager) 
+    : std::make_shared<PluginManager>()),
+    m_etcd_client("http://etcd:2379"),
+    m_autoscaler(m_etcd_client, *metrics_reporter),
+    m_task_scheduler(m_io_ctx, std::thread::hardware_concurrency()),
+    m_pbft_engine(m_io_ctx, m_etcd_client),
+    m_metrics_reporter(metrics_reporter) {
+    
+    if (!m_secret_vault || !m_metrics_reporter || !logger) {
+        throw std::invalid_argument("Invalid core component initialization");
+    }
+    
+    try {
+        setup_security_infrastructure();
+        init_hardware();
+        load_configuration();
+        
+        // Инициализация сетевого стека
+        m_network_stack = std::make_unique<AsioNetworkStack>(m_io_ctx, *m_network_config);
+        
+        // Основные модули
+        m_hypervisor = std::make_unique<HypervisorManager>(m_logger, m_metrics_reporter);
+        m_storage = std::make_unique<StorageController>(m_logger, m_secret_vault);
+        m_rest_server = std::make_unique<RestServer>(
+            std::make_shared<AuthService>(m_secret_vault, m_logger, m_metrics_reporter),
+            m_hypervisor.get(), 
+            m_storage.get(),
+            m_logger,
+            m_network_config
+        );
+        
+        // Блокчейн и консенсус
+        initialize_blockchain();
+        m_pbft_engine.initialize(m_secret_vault->get_private_key());
+        
+        // Межмодульное взаимодействие
+        setup_inter_module_communication();
+        
+        m_logger->log(Logger::Level::Info, "CoreEngine initialized", { 
+            {"config_path", m_config_path},
+            {"network_mode", m_network_config->dpdk_enabled ? "DPDK" : "Asio"},
+            {"hardware_acceleration", {
+                {"gpu", m_network_config->gpu_enabled},
+                {"fpga", m_network_config->fpga_enabled}
+            }}
+        });
+    } catch (const std::exception& ex) {
+        m_logger->log(Logger::Level::Critical, "CoreEngine initialization failed", {
+            {"error", ex.what()}
+        });
+        throw;
+    }
+}
+
+CoreEngine::~CoreEngine() noexcept {
+    if (m_shutdown_initiated.exchange(true)) return;
+    
+    try {
+        if (m_running.load()) {
+            m_logger->log(Logger::Level::Warning,
+                "CoreEngine destroyed without proper shutdown");
+            emergency_stop();
+        }
+        
+        // Освобождение ресурсов
+        m_work_pool.stop();
+        m_work_pool.join();
+        cleanup_resources();
+        
+        m_logger->log(Logger::Level::Info, "CoreEngine shutdown completed");
+    } catch (const std::exception& ex) {
+        std::cerr << "Fatal error during destruction: " << ex.what() << std::endl;
+        std::terminate();
+    }
+}
+
+void CoreEngine::start() {
+    if (m_running.exchange(true)) {
+        m_logger->log(Logger::Level::Warning, "Attempt to start already running engine");
+        return;
+    }
+    
+    try {
+        // Запуск сетевого стека
+        start_network_stack();
+        
+        // Инициализация консенсуса
+        start_consensus_engine();
+        
+        // Планировщик задач
+        m_task_scheduler.start();
+        
+        // Фоновые процессы
+        start_monitoring();
+        schedule_maintenance();
+        
+        // Запуск рабочих потоков
+        for (size_t i = 0; i < std::thread::hardware_concurrency(); ++i) {
+            asio::post(m_work_pool, [this] {
+                m_io_ctx.run();
+            });
+        }
+        
+        m_metrics_reporter->log_event("SystemStart");
+        m_logger->log(Logger::Level::Info, "CoreEngine started successfully");
+        
+    } catch (const std::exception& ex) {
+        handle_critical_failure();
+        throw;
+    }
+}
+
+void CoreEngine::emergency_stop() {
+    if (!m_running.exchange(false)) return;
+    
+    m_logger->log(Logger::Level::Critical, "Initiating emergency stop");
+    
+    // Немедленная остановка
+    m_work_guard.reset();
+    m_work_pool.stop();
+    m_io_ctx.stop();
+    
+    // Сохранение состояния
+    save_recovery_state();
+    cleanup_resources();
+    
+    m_metrics_reporter->log_event("EmergencyStop");
+}
+
+void CoreEngine::graceful_shutdown() {
+    if (!m_running.exchange(false)) return;
+    
+    m_logger->log(Logger::Level::Info, "Starting graceful shutdown");
+    
+    // Упорядоченная остановка
+    m_task_scheduler.stop();
+    m_pbft_engine.stop();
+    m_rest_server->shutdown();
+    m_autoscaler.disable();
+    
+    // Ожидание завершения
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    m_work_pool.stop();
+    m_work_pool.join();
+    
+    m_metrics_reporter->log_event("GracefulShutdown");
+}
+
+void CoreEngine::init_hardware() {
+    if (m_network_config->gpu_enabled) {
+        init_gpu_context();
+    }
+    if (m_network_config->fpga_enabled) {
+        init_fpga_context(m_network_config->fpga_bitstream);
+    }
+    if (m_network_config->dpdk_enabled) {
+        m_smartnic_manager.initialize(*m_network_config);
+    }
+}
+
+void CoreEngine::init_gpu_context() {
+    CUDA_CHECK(cudaSetDevice(0));
+    CUDA_CHECK(cudaStreamCreate(&m_cuda_context.stream));
+    m_logger->log(Logger::Level::Info, "GPU context initialized");
+}
+
+void CoreEngine::init_fpga_context(const std::string& bitstream_path) {
+    m_fpga_accelerator.load_bitstream(bitstream_path);
+    m_fpga_accelerator.initialize();
+    m_logger->log(Logger::Level::Info, "FPGA context initialized", {
+        {"bitstream", bitstream_path}
+    });
+}
+
+void CoreEngine::load_configuration() {
+    auto config = ConfigLoader::load(m_config_path);
+    m_config_validator->validate(config);
+    
+    // Применение сетевых настроек
+    m_network_config->apply(config.network_settings);
+    
+    // Загрузка модулей
+    for (const auto& module_cfg : config.modules) {
+        m_plugin_manager->load_module(module_cfg);
+    }
+}
+
+void CoreEngine::start_network_stack() {
+    m_network_stack->start([this](auto packet) {
+        m_packet_queue.push(packet);
+    });
+    m_logger->log(Logger::Level::Info, "Network stack started");
+}
+
+void CoreEngine::start_consensus_engine() {
+    m_pbft_engine.start_consensus();
+    m_logger->log(Logger::Level::Info, "Consensus engine started");
+}
+
+void CoreEngine::start_monitoring() {
+    m_resource_monitor.initialize();
+    m_resource_monitor.start_watching();
+    m_logger->log(Logger::Level::Info, "Monitoring system activated");
+}
+
+void CoreEngine::schedule_maintenance() {
+    asio::post(m_io_ctx, [this]() {
+        while (m_running.load()) {
+            check_system_health();
+            scale_resources();
+            verify_blockchain_integrity();
+            std::this_thread::sleep_for(std::chrono::minutes(1));
+        }
+    });
+}
+
+void CoreEngine::cleanup_resources() {
+    m_hotswap_manager.unload_all();
+    m_plugin_manager->unload_all_plugins();
+    
+    if (m_network_config->dpdk_enabled) {
+        m_smartnic_manager.shutdown();
+    }
+    m_fpga_accelerator.release();
+    if (m_network_config->gpu_enabled) {
+        CUDA_CHECK(cudaStreamDestroy(m_cuda_context.stream));
+    }
+}
+
+void CoreEngine::check_system_health() {
+    try {
+        auto metrics = m_resource_monitor.get_current_metrics();
+        
+        // Контроль использования CPU
+        if (metrics.cpu_usage > 90.0) {
+            m_logger->log(Logger::Level::Warning, "High CPU usage", metrics);
+            m_autoscaler.scale_up();
+        }
+        
+        // Контроль памяти
+        if (metrics.memory_usage > 85.0) {
+            m_logger->log(Logger::Level::Warning, "High memory usage", metrics);
+        }
+        
+        // Контроль температуры GPU
+        if (metrics.gpu_temperature > 85.0) {
+            m_logger->log(Logger::Level::Error, "GPU overheating", metrics);
+            enable_gpu_acceleration(false);
+        }
+        
+        // Контроль состояния блокчейна
+        if (!m_pbft_engine.is_healthy()) {
+            m_logger->log(Logger::Level::Critical, "Consensus health check failed");
+            handle_critical_failure();
+        }
+        
+    } catch (const std::exception& ex) {
+        m_logger->log(Logger::Level::Error, "Health check failed", {
+            {"error", ex.what()}
+        });
+    }
+}
+
+void CoreEngine::handle_critical_failure() {
+    m_logger->log(Logger::Level::Critical, "Critical failure detected");
+    
+    // Сохранение состояния для последующего анализа
+    save_recovery_state();
+    
+    // Уведомление кластера через etcd
+    m_etcd_client.report_failure();
+    
+    // Аварийное отключение аппаратных компонентов
+    m_fpga_accelerator.emergency_shutdown();
+    m_smartnic_manager.emergency_stop();
+    
+    throw std::runtime_error("Critical system failure");
+}
+
+void CoreEngine::save_recovery_state() {
+    try {
+        BlockchainState state = m_pbft_engine.get_current_state();
+        m_snapshot_manager.save_state(state);
+        m_logger->log(Logger::Level::Info, "Recovery state saved");
+    } catch (const std::exception& ex) {
+        m_logger->log(Logger::Level::Error, "Failed to save recovery state", {
+            {"error", ex.what()}
+        });
+    }
+}
+
+void CoreEngine::scale_resources() {
+    auto metrics = m_metrics_reporter->get_cluster_metrics();
+    
+    // Вертикальное масштабирование
+    if (metrics.node_utilization > 80.0) {
+        m_autoscaler.scale_up();
+    }
+    
+    // Горизонтальное масштабирование
+    if (metrics.cluster_load > 75.0) {
+        m_autoscaler.add_node();
+    }
+}
+
+void CoreEngine::setup_security_infrastructure() {
+    // Инициализация TLS контекста
+    m_network_config->init_tls_context(
+        m_secret_vault->get_certificate(),
+        m_secret_vault->get_private_key()
+    );
+    
+    // Настройка брандмауэра
+    m_network_stack->configure_firewall(m_config_validator->get_firewall_rules());
+    
+    m_logger->log(Logger::Level::Info, "Security infrastructure initialized");
+}
+
+void CoreEngine::validate_dependencies() const {
+    // Проверка версий библиотек
+    if (!check_openssl_version()) {
+        throw std::runtime_error("OpenSSL version mismatch");
+    }
+    
+    // Проверка доступности GPU
+    if (m_network_config->gpu_enabled && !cuda_available()) {
+        throw std::runtime_error("CUDA not available");
+    }
+}
+
+void CoreEngine::load_essential_plugins() {
+    try {
+        m_plugin_manager->load_essential_plugins({
+            "/usr/lib/cloud-iaas/plugins/libsecurity.so",
+            "/usr/lib/cloud-iaas/plugins/libmonitoring.so"
+        });
+        m_logger->log(Logger::Level::Info, "Essential plugins loaded");
+    } catch (const PluginLoadException& ex) {
+        m_logger->log(Logger::Level::Critical, "Failed to load core plugins", {
+            {"error", ex.what()},
+            {"code", ex.code()}
+        });
+        throw;
+    }
+}
+
+void CoreEngine::initialize_blockchain() {
+    // Инициализация майнеров
+    if (m_network_config->gpu_enabled) {
+        m_pbft_engine.register_miner(std::make_unique<GPUMiner>(m_cuda_context));
+    }
+    if (m_network_config->fpga_enabled) {
+        m_pbft_engine.register_miner(std::make_unique<FPGAMiner>(m_fpga_accelerator));
+    }
+    
+    // Инициализация смарт-контрактов
+    m_contract_vm.initialize(m_storage.get());
+    
+    m_logger->log(Logger::Level::Info, "Blockchain subsystem initialized");
+}
+
+void CoreEngine::setup_inter_module_communication() {
+    // Связь сетевого стека с блокчейном
+    m_network_stack->set_packet_handler([this](auto metrics) {
+        m_autoscaler.update_metrics(metrics);
+    });
+    
+    // Связь мониторинга с автопроксированием
+    m_resource_monitor.set_metrics_handler([this](auto metrics) {
+        m_autoscaler.update_metrics(metrics);
+    });
+}
+
+void CoreEngine::process_packets() {
+    while (m_running.load()) {
+        NetworkPacket* packet;
+        if (m_packet_queue.pop(packet)) {
+            handle_network_packet(packet);
+            delete packet;
+        }
+    }
+}
+
+void CoreEngine::update_service_registry() {
+    NodeInfo info{
+        .address = m_network_config->public_ip,
+        .status = m_running.load() ? "active" : "inactive"
+    };
+    m_etcd_client.register_service("core-node", info);
+}
+
+void CoreEngine::configure_hardware_offloading() {
+    if (m_network_config->dpdk_enabled) {
+        m_smartnic_manager.configure_offloading(
+            SmartNIC::OffloadFlags::CHECKSUM |
+            SmartNIC::OffloadFlags::CRYPTO
+        );
+    }
+}
+
+void CoreEngine::handle_network_packet(NetworkPacket* packet) {
+    try {
+        switch (packet->type) {
+            case PacketType::BLOCKCHAIN:
+                m_pbft_engine.process_packets(*packet);
+                break;
+                
+            case PacketType::REST_API:
+                m_rest_server->handle_request(packet->data);
+                break;
+                
+            case PacketType::METRICS:
+                m_metrics_reporter->process_metrics(packet->data);
+                break;
+                
+            case PacketType::CONFIG_UPDATE:
+                handle_config_update(packet->data);
+                break;
+                
+            case PacketType::HEALTH_CHECK:
+                handle_health_check(packet->data);
+                break;
+                
+            case PacketType::CONSENSUS:
+                m_pbft_engine.handle_consensus_message(packet->data);
+                break;
+                
+            case PacketType::STORAGE:
+                m_storage->handle_storage_request(packet->data);
+                break;
+                
+            case PacketType::CONTRACT:
+                m_contract_vm.handle_contract_message(packet->data);
+                break;
+                
+            default:
+                m_logger->log(Logger::Level::Warning, "Unknown packet type", {
+                    {"type", static_cast<int>(packet->type)}
+                });
+                break;
+        }
+        
+        // Обновление метрик
+        m_metrics_reporter->record_packet_processed(packet->type);
+        
+    } catch (const std::exception& ex) {
+        m_logger->log(Logger::Level::Error, "Packet handling failed", {
+            {"type", static_cast<int>(packet->type)},
+            {"error", ex.what()}
+        });
+        
+        // Отправка ошибки обратно отправителю
+        if (packet->requires_response) {
+            send_error_response(packet->source, ex.what());
+        }
+    }
+}
+
+void CoreEngine::deploy_smart_contract(const std::string& contract_code) {
+    try {
+        // Валидация контракта
+        if (!m_contract_vm.validate_contract(contract_code)) {
+            throw std::runtime_error("Invalid contract code");
+        }
+        
+        // Компиляция контракта
+        auto compiled_contract = m_contract_vm.compile(contract_code);
+        
+        // Деплой контракта
+        ContractID id = m_contract_vm.deploy(compiled_contract);
+        
+        // Регистрация в блокчейне
+        m_pbft_engine.broadcast_contract(id);
+        
+        // Сохранение метаданных контракта
+        m_storage->store_contract_metadata(id, {
+            .code_hash = calculate_code_hash(contract_code),
+            .deploy_time = std::chrono::system_clock::now(),
+            .deployer = m_secret_vault->get_public_key()
+        });
+        
+        m_logger->log(Logger::Level::Info, "Smart contract deployed", {
+            {"contract_id", id},
+            {"code_size", contract_code.size()},
+            {"compiled_size", compiled_contract.size()}
+        });
+        
+    } catch (const std::exception& ex) {
+        m_logger->log(Logger::Level::Error, "Contract deployment failed", {
+            {"error", ex.what()}
+        });
+        throw;
+    }
+}
+
+void CoreEngine::execute_contract(const std::string& contract_id) {
+    try {
+        // Проверка существования контракта
+        if (!m_storage->contract_exists(contract_id)) {
+            throw std::runtime_error("Contract not found: " + contract_id);
+        }
+        
+        // Получение состояния контракта
+        auto contract_state = m_storage->get_contract_state(contract_id);
+        
+        // Проверка прав доступа
+        if (!has_contract_execution_permission(contract_id)) {
+            throw std::runtime_error("No permission to execute contract");
+        }
+        
+        // Выполнение контракта
+        ContractResult result = m_contract_vm.execute(contract_id, contract_state);
+        
+        if (!result.success) {
+            m_logger->log(Logger::Level::Error, "Contract execution failed", {
+                {"contract_id", contract_id},
+                {"error", result.error},
+                {"gas_used", result.gas_used}
+            });
+            throw std::runtime_error("Contract execution failed: " + result.error);
+        }
+        
+        // Обновление состояния контракта
+        m_storage->update_contract_state(contract_id, result.new_state);
+        
+        // Запись транзакции в блокчейн
+        m_pbft_engine.record_contract_transaction(contract_id, result);
+        
+        m_logger->log(Logger::Level::Info, "Contract executed successfully", {
+            {"contract_id", contract_id},
+            {"gas_used", result.gas_used},
+            {"execution_time", result.execution_time.count()}
+        });
+        
+    } catch (const std::exception& ex) {
+        m_logger->log(Logger::Level::Error, "Contract execution failed", {
+            {"contract_id", contract_id},
+            {"error", ex.what()}
+        });
+        throw;
+    }
+}
+
+void CoreEngine::verify_blockchain_integrity() {
+    try {
+        // Проверка целостности блокчейна
+        auto current_state = m_pbft_engine.get_current_state();
+        auto last_verified_block = m_snapshot_manager.get_last_verified_block();
+        
+        // Проверка хешей блоков
+        for (const auto& block : current_state.blocks) {
+            if (block.height <= last_verified_block.height) {
+                continue;
+            }
+            
+            // Проверка подписи блока
+            if (!m_pbft_engine.verify_block_signature(block)) {
+                m_logger->log(Logger::Level::Error, "Block signature verification failed", {
+                    {"block_height", block.height},
+                    {"block_hash", block.hash}
+                });
+                handle_critical_failure();
+                return;
+            }
+            
+            // Проверка связей между блоками
+            if (block.height > 1) {
+                auto prev_block = current_state.blocks[block.height - 2];
+                if (block.prev_hash != prev_block.hash) {
+                    m_logger->log(Logger::Level::Error, "Block chain integrity violation", {
+                        {"block_height", block.height},
+                        {"expected_prev_hash", prev_block.hash},
+                        {"actual_prev_hash", block.prev_hash}
+                    });
+                    handle_critical_failure();
+                    return;
+                }
+            }
+        }
+        
+        // Обновление последнего проверенного блока
+        m_snapshot_manager.update_last_verified_block(current_state.blocks.back());
+        
+        m_logger->log(Logger::Level::Info, "Blockchain integrity verification completed", {
+            {"verified_blocks", current_state.blocks.size()},
+            {"last_verified_height", current_state.blocks.back().height}
+        });
+        
+    } catch (const std::exception& ex) {
+        m_logger->log(Logger::Level::Error, "Blockchain integrity check failed", {
+            {"error", ex.what()}
+        });
+        handle_critical_failure();
+    }
+}
+
+void CoreEngine::connect_to_kubernetes(const std::string& kubeconfig_path) {
+    m_k8s_manager.initialize(kubeconfig_path);
+    m_autoscaler.set_kubernetes_manager(&m_k8s_manager);
+    m_logger->log(Logger::Level::Info, "Kubernetes integration activated");
+}
+
+} // namespace core 

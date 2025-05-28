@@ -1,0 +1,74 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloud-service
+  namespace: cloud-service
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: cloud-service
+  template:
+    metadata:
+      labels:
+        app: cloud-service
+    spec:
+      containers:
+      - name: cloud-service
+        image: cloud-service:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+          name: http
+        - containerPort: 9090
+          name: metrics
+        - containerPort: 14268
+          name: tracing
+        env:
+        - name: CONFIG_PATH
+          value: /etc/cloud-service/config.json
+        - name: LOG_LEVEL
+          value: info
+        volumeMounts:
+        - name: config
+          mountPath: /etc/cloud-service
+        - name: data
+          mountPath: /var/lib/cloud-service/data
+        resources:
+          requests:
+            cpu: "1"
+            memory: "1Gi"
+          limits:
+            cpu: "4"
+            memory: "4Gi"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: config
+        configMap:
+          name: cloud-service-config
+      - name: data
+        persistentVolumeClaim:
+          claimName: cloud-service-data
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - cloud-service
+              topologyKey: kubernetes.io/hostname 

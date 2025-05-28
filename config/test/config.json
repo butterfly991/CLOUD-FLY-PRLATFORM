@@ -1,0 +1,33 @@
+{
+    "core": {
+        "log_level": "debug",
+        "metrics_enabled": true,
+        "performance_monitoring": true
+    },
+    "network": {
+        "port": 8081,
+        "max_connections": 100,
+        "timeout_ms": 1000,
+        "use_dpdk": false
+    },
+    "blockchain": {
+        "consensus": "pbft",
+        "block_time_ms": 500,
+        "max_block_size": 100000,
+        "min_validators": 2
+    },
+    "storage": {
+        "cache_size_mb": 256,
+        "use_numa": false,
+        "persistence_path": "./data/test"
+    },
+    "security": {
+        "enclave_enabled": false,
+        "tls_enabled": false,
+        "cert_path": "./certs/test"
+    },
+    "monitoring": {
+        "prometheus_port": 9091,
+        "jaeger_endpoint": "http://localhost:14268/api/traces"
+    }
+} 
