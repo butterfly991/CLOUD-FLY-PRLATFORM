@@ -419,7 +419,7 @@ cloud-platform/
 - **Планирование**: Real-time, Deadline
 - **Коммуникация**: Message passing, Shared memory
 
-## 4. Технологический Стек
+## Технологический Стек
 
 ### Операционные Системы
 - Linux 5.15+ с RT-PREEMPT
